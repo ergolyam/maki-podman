@@ -9,6 +9,7 @@ local specs = {
   operation_timeout_ms = { default = 120000, type = "integer", min = 1, desc = "Timeout for Podman management and file operations, in milliseconds." },
   timeout_secs = { default = 120, type = "integer", min = 5, desc = "Default bash command timeout, in seconds." },
   background_on_timeout = { default = false, desc = "Move eligible bash commands to the background on timeout." },
+  remove_on_session_end = { default = false, desc = "Remove the chat container when its session ends instead of stopping it." },
   background_log_bytes = { default = 32 * 1024 * 1024, type = "integer", min = 1024, desc = "Bash output log rotation size; capped at 1 GiB." },
   max_output_lines = { type = "integer", desc = "Override agent.max_output_lines for bash." },
   max_output_bytes = { type = "integer", desc = "Override agent.max_output_bytes for bash." },

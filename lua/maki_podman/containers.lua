@@ -36,6 +36,7 @@ function M.new(options)
     shell = text(options.shell or "/bin/sh", "shell"),
     volume_options = options.volume_options == nil and "z" or options.volume_options,
     operation_timeout_ms = positive(options.operation_timeout_ms or 120000, "operation_timeout_ms"),
+    remove_on_session_end = options.remove_on_session_end == true,
   }
   assert(opts.shell:sub(1, 1) == "/", "shell must be an absolute path inside the container")
   assert(opts.volume_options == "z" or opts.volume_options == "Z" or opts.volume_options == "", "volume_options must be 'z', 'Z', or ''")
@@ -324,20 +325,22 @@ function M.new(options)
   local function stop(sid, deadline, reason)
     local state = states[sid]
     if reason == "shutdown" or reason == "reload" then
-      -- All teardown events share Maki's two-second budget. Stop the known
+      -- All teardown events share Maki's two-second budget. Handle the known
       -- containers in one request, rather than spending that budget per tab.
       if ending then
         return true
       end
       ending = true
-      local args = { "stop", "--ignore", "--time", "0" }
+      local args = opts.remove_on_session_end and { "rm", "--force", "--ignore", "--time", "0" }
+        or { "stop", "--ignore", "--time", "0" }
+      local base_count = #args
       for _, entry in pairs(states) do
         close(entry)
         if entry.id then
           args[#args + 1] = entry.id
         end
       end
-      if #args == 4 then
+      if #args == base_count then
         return true
       end
       return checked(args, math.max(1, (deadline or 2000) - SHUTDOWN_RESERVE_MS))
@@ -353,7 +356,9 @@ function M.new(options)
       if not state.id then
         return true
       end
-      return checked({ "stop", "--ignore", "--time", "0", state.id }, deadline and math.max(1, deadline - SHUTDOWN_RESERVE_MS))
+      local args = opts.remove_on_session_end and { "rm", "--force", "--ignore", "--time", "0", state.id }
+        or { "stop", "--ignore", "--time", "0", state.id }
+      return checked(args, deadline and math.max(1, deadline - SHUTDOWN_RESERVE_MS))
     end
     if deadline ~= nil then
       return stop_one()
