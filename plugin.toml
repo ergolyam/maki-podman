@@ -1,0 +1,7 @@
+min_maki_version = "0.7.0"
+
+[permissions]
+fs_read = true
+fs_write = true
+run = true
+agent = true
