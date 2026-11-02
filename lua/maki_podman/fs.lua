@@ -175,7 +175,7 @@ function M.new(manager, options)
     function fs.basename(path) return path:gsub("/+$", ""):match("([^/]+)$") end
     function fs.joinpath(...)
       local parts = { ... }
-      return table.concat(parts, "/"):gsub("/+", "/")
+      return (table.concat(parts, "/"):gsub("/+", "/"))
     end
     function fs.normalize(path)
       local parts = {}
