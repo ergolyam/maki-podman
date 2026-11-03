@@ -25,6 +25,7 @@ Requires **Linux**, **Maki 0.7.0+**, **Podman**, **Git**, and **GNU coreutils** 
       ["maki-podman"] = {
         image = "localhost/maki-podman:latest",
         volume_options = "z",
+        remove_on_session_end = true,
       },
     }
 
@@ -51,12 +52,13 @@ Set options under `plugins["maki-podman"]` in `init.lua`.
 | `volume_options` | `z` | SELinux mount option (`z`, `Z`, or `""`) |
 | `timeout_secs` | `120` | Default Bash command timeout in seconds |
 | `operation_timeout_ms` | `120000` | Podman and file operation timeout in milliseconds |
+| `remove_on_session_end` | `false` | Remove the container instead of stopping it when the session ends |
 
 Custom images must provide Bash (or the configured shell), Lua 5.4, LuaFileSystem, ripgrep, and GNU coreutils. See [`Containerfile`](Containerfile).
 
 ## Features
 
-- **Per-chat containers**: Create a container for each chat, restart it when reopened, and stop it when closed.
+- **Per-chat containers**: Create a container for each chat, restart it when reopened, and stop it when closed (or remove it with `remove_on_session_end`).
 - **Workspace mounting**: Mount the current working directory at the same absolute path; recreate the container after `/cd`.
 - **Container-based tools**: Run `bash`, `read`, `write`, `edit`, `list`, `glob`, `grep`, `index`, `view_image`, and related tools against the container filesystem.
 - **Original tool behavior**: Preserve tool interfaces, permission checks, editing safeguards, background commands, memory, and skills.
