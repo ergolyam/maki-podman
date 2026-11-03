@@ -86,8 +86,8 @@ function M.register(manager, options)
         end
         for _, name in ipairs(names) do
           local path = fs.joinpath(parent, name)
-          local meta = fs.metadata(path)
-          if meta and meta.is_file and not h.instructions[path] then
+          local meta = not h.instructions[path] and fs.metadata(path)
+          if meta and meta.is_file then
             local content = checked(fs.read(path))
             local block = { path = path, text = "\n\nContainer instructions from " .. path .. ":\n" .. content }
             instructions[path] = block

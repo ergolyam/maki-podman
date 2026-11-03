@@ -1,20 +1,9 @@
-local worker = require("maki_podman.worker_source")
 local M = {}
 local MAX_BYTES = 64 * 1024 * 1024
-local FRAME_BYTES = 128 * 1024
 
 local function checked(value, err)
   if value == nil then error(tostring(err or "container filesystem operation failed"), 0) end
   return value
-end
-
-local function host_job(args, timeout)
-  local job, err = maki.fn.jobstart(args, { cwd = "/" })
-  if not job then return nil, err end
-  local result, wait_err = maki.fn.jobwait(job, timeout)
-  if not result then maki.fn.jobstop(job); return nil, wait_err end
-  if result.exit_code ~= 0 then return nil, result.stderr or "transport process failed" end
-  return result.stdout
 end
 
 local function dirname(path)
@@ -29,42 +18,15 @@ end
 
 function M.new(manager, options)
   options = options or {}
-  local timeout = options.operation_timeout_ms or 120000
-  local lua = options.lua or "lua5.4"
-  assert(type(lua) == "string" and lua ~= "" and not lua:find("\0", 1, true), "lua must name the container Lua executable")
+  local transport = require("maki_podman.transport").new(manager, options)
   local factory = {}
 
   function factory.for_context(ctx)
-    local target, staging, remote, home, initialized
+    local target, channel, home, initialized
     local opening = maki.async.semaphore(1)
-    local sequence, closed = 0, false
+    local closed = false
     local seen, expected = {}, {}
     local fs = {}
-
-    local function run(args, on_stdout)
-      local job, err, cancel = manager.exec_prepared(target, args, {
-        tail = 5, max_line_bytes = FRAME_BYTES, on_stdout = on_stdout,
-      }, ctx)
-      checked(job, err)
-      local result, wait_err = maki.fn.jobwait(job, timeout)
-      if not result then
-        if cancel then cancel() end
-        maki.fn.jobstop(job)
-        error(tostring(wait_err), 0)
-      end
-      if result.exit_code ~= 0 then
-        error("container filesystem helper failed (exit " .. tostring(result.exit_code) .. "): " .. (result.stderr or "")
-          .. "; the image needs Lua 5.4, LuaFileSystem, ripgrep and GNU coreutils", 0)
-      end
-      return result
-    end
-
-    local function cleanup()
-      if remote and target then manager.cleanup(target, remote) end
-      if staging then
-        maki.fn.jobstart({ "rm", "-rf", "--", staging }, { cwd = "/", scope = "plugin", tail = 0 })
-      end
-    end
 
     local function open()
       if closed or ctx:cancelled() then error("container file call is closed or cancelled", 0) end
@@ -76,61 +38,51 @@ function M.new(manager, options)
       local ok, err = pcall(function()
         if initialized then return end
         target = checked(manager.prepare(ctx))
-        staging = checked(host_job({ "mktemp", "-d", "/tmp/maki-podman-files.XXXXXXXXXX" }, timeout)):match("^%s*(.-)%s*$")
-        assert(staging:match("^/tmp/maki%-podman%-files%.[A-Za-z0-9]+$"), "invalid private transfer directory")
-        remote = staging .. "-remote"
-        maki.async.on_cancel(cleanup)
-        checked(maki.fs.write(staging .. "/worker.lua", worker))
-        run({ "/bin/sh", "-c", 'umask 077; mkdir -- "$1"', "maki-files", remote })
-        checked(manager.copy_in(target, staging .. "/worker.lua", remote .. "/worker.lua"))
+        channel = checked(transport.open(target, ctx))
+        home = type(channel.context.home) == "string" and channel.context.home or false
         initialized = true
       end)
       release()
-      if not ok then cleanup(); error(err, 0) end
+      if not ok then error(err, 0) end
     end
 
     local function rpc(request)
       open()
       if ctx:cancelled() then error("container file call was cancelled", 0) end
-      sequence = sequence + 1
-      local name = "request-" .. sequence .. ".json"
-      local local_path, remote_path = staging .. "/" .. name, remote .. "/" .. name
-      checked(maki.fs.write(local_path, maki.json.encode(request)))
-      checked(manager.copy_in(target, local_path, remote_path))
       local chunks, lines, line_chunks, entries, entry_chunks = {}, {}, {}, {}, {}
-      local terminal, protocol_error, bytes = nil, nil, 0
+      local terminal, bytes = nil, 0
+      local function count(size)
+        bytes = bytes + size
+        if bytes > MAX_BYTES + 1024 * 1024 then error("container response exceeds the 64 MiB transfer limit", 0) end
+      end
       local function decode64(encoded)
         local value, err = maki.base64.decode(encoded)
-        if not value then protocol_error = "invalid filesystem response: " .. tostring(err); return "" end
-        bytes = bytes + #value
-        if bytes > MAX_BYTES + 1024 * 1024 then protocol_error = "container response exceeds the 64 MiB transfer limit" end
+        if not value then error("invalid filesystem response: " .. tostring(err), 0) end
+        count(#value)
         return value
       end
-      local function accept(_, line, _, actual_bytes)
-        if protocol_error then return end
-        if actual_bytes and actual_bytes > #line then protocol_error = "container filesystem response was truncated"; return end
-        local frame, err = maki.json.decode(line)
-        if type(frame) ~= "table" or terminal then protocol_error = "invalid filesystem response: " .. tostring(err or "unexpected frame"); return end
+      local function accept(frame, encoded_bytes)
         if frame.chunk then chunks[#chunks + 1] = decode64(frame.chunk)
         elseif frame.line_chunk then line_chunks[#line_chunks + 1] = decode64(frame.line_chunk)
-        elseif frame.line_end then lines[#lines + 1] = table.concat(line_chunks); line_chunks = {}
+        elseif frame.line_end then count(24); lines[#lines + 1] = table.concat(line_chunks); line_chunks = {}
         elseif frame.entry_chunk then entry_chunks[#entry_chunks + 1] = decode64(frame.entry_chunk)
         elseif frame.entry_end then
           local entry, decode_err = maki.json.decode(table.concat(entry_chunks))
-          if entry == nil then protocol_error = "invalid filesystem entry: " .. tostring(decode_err) else entries[#entries + 1] = entry end
+          if entry == nil then error("invalid filesystem entry: " .. tostring(decode_err), 0) end
+          entries[#entries + 1] = entry
           entry_chunks = {}
         elseif frame.entry ~= nil then
-          bytes = bytes + #line
-          if bytes > MAX_BYTES + 1024 * 1024 then protocol_error = "container response exceeds the 64 MiB transfer limit" end
+          count(encoded_bytes)
           entries[#entries + 1] = frame.entry
-        elseif frame.ok ~= nil then terminal = frame
-        else protocol_error = "unknown filesystem response frame" end
+        else error("unknown filesystem response frame", 0) end
       end
-      local ok, result = pcall(run, { lua, remote .. "/worker.lua", remote_path }, accept)
-      maki.fs.rm(local_path, { force = true })
-      if not ok then error(result, 0) end
-      if protocol_error then error(protocol_error, 0) end
-      if not terminal or #line_chunks > 0 or #entry_chunks > 0 then error("incomplete container filesystem response", 0) end
+      local transport_err
+      terminal, transport_err = channel.rpc(request, accept, ctx)
+      if not terminal then error(tostring(transport_err), 0) end
+      if #line_chunks > 0 or #entry_chunks > 0 then
+        channel.close("incomplete container filesystem response")
+        error("incomplete container filesystem response", 0)
+      end
       if not terminal.ok then error(tostring(terminal.error), 0) end
       local value = terminal.value
       if request.op == "read" or request.op == "read_bytes" then
@@ -156,10 +108,6 @@ function M.new(manager, options)
 
     function fs.state()
       open()
-      if home == nil then
-        local env = checked(safe({ op = "context" }))
-        home = type(env.home) == "string" and env.home or false
-      end
       return { id = target.id, sid = target.sid, cwd = target.cwd, home = home or nil, resources = target.resources or {} }
     end
     function fs.abspath(path)
@@ -228,7 +176,6 @@ function M.new(manager, options)
     function fs.close()
       if closed then return end
       closed = true
-      cleanup()
     end
     return fs
   end

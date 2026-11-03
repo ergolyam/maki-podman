@@ -1,10 +1,33 @@
 -- Generated from worker.lua by scripts/sync-worker.py; do not edit this copy.
 return [====[
 -- Runs only inside the chat container. Dependencies: Lua 5.4, LuaFileSystem,
--- ripgrep and GNU coreutils (realpath/stat). The wire format is NDJSON.
+-- ripgrep and GNU coreutils (realpath/stat). Server mode also needs LuaSocket.
+-- Requests have an eight-hex-digit length and newline prefix; replies are NDJSON.
 local lfs = require("lfs")
 local MAX_BYTES = 64 * 1024 * 1024
 local CHUNK = 48 * 1024
+local FRAME_BYTES = 128 * 1024
+local PROTOCOL = 1
+local connection, response_id, send_failed
+local handles, temporary = {}, {}
+
+local function track(handle)
+  if handle then handles[#handles + 1] = handle end
+  return handle
+end
+local function open_file(path, mode)
+  local file, err = io.open(path, mode)
+  return track(file), err
+end
+local function open_pipe(command)
+  local pipe, err = io.popen(command, "r")
+  return track(pipe), err
+end
+local function cleanup()
+  for i = #handles, 1, -1 do pcall(function() handles[i]:close() end) end
+  for _, path in ipairs(temporary) do os.remove(path) end
+  handles, temporary = {}, {}
+end
 local NULL = setmetatable({}, { __json_null = true })
 local ARRAY = { __json_array = true }
 local function array(t) return setmetatable(t or {}, ARRAY) end
@@ -201,7 +224,18 @@ local function base64_decode(s)
 end
 
 local function emit(value)
-  io.write(json_encode(value), "\n")
+  if response_id ~= nil then value.id = response_id end
+  local line = json_encode(value) .. "\n"
+  if #line > FRAME_BYTES then error("filesystem response frame exceeds the 128 KiB limit", 0) end
+  if connection then
+    local sent, err = connection:send(line)
+    if sent ~= #line then
+      send_failed = true
+      error("filesystem connection failed: " .. tostring(err or "short write"), 0)
+    end
+  else
+    io.write(line)
+  end
 end
 local function chunks(s, key)
   for start = 1, #s, CHUNK do emit({ [key or "chunk"] = base64_encode(s:sub(start, start + CHUNK - 1)) }) end
@@ -241,7 +275,7 @@ local function command(args)
   return table.concat(out, " ")
 end
 local function capture(args)
-  local pipe = checked(io.popen(command(args) .. " 2>/dev/null", "r"))
+  local pipe = checked(open_pipe(command(args) .. " 2>/dev/null"))
   local result = pipe:read(MAX_BYTES + 1)
   local ok,_,status = pipe:close()
   if result and #result > MAX_BYTES then error("command output exceeds the 64 MiB limit", 0) end
@@ -351,7 +385,7 @@ local function read_lines(path, opts)
   path = abspath(path)
   regular(path)
   local before = fingerprint(path)
-  local file = checked(io.open(path,"rb"))
+  local file = checked(open_file(path,"rb"))
   local nextline = scanner(file)
   local offset = math.max(integer(opts.offset,1,0,"offset"),1)
   local limit = integer(opts.limit,0,0,"limit")
@@ -384,7 +418,7 @@ local function read_all(path, opts, binary)
   path = abspath(path)
   local attr = regular(path)
   local before = fingerprint(path)
-  local file = checked(io.open(path,"rb"))
+  local file = checked(open_file(path,"rb"))
   local result
   if binary then
     local offset = integer(opts.offset,0,-MAX_BYTES*1024,"offset")
@@ -465,7 +499,7 @@ local function write_file(path, req, append)
   if #data > MAX_BYTES then error("write exceeds the 67108864-byte transfer limit",0) end
   local a = lfs.attributes(path)
   if a and a.mode ~= "file" then error("path is not a regular file: " .. path,0) end
-  local file = checked(io.open(path,append and "ab" or "wb"))
+  local file = checked(open_file(path,append and "ab" or "wb"))
   local ok,err = file:write(data)
   local closed,close_err = file:close()
   checked(ok,err)
@@ -494,6 +528,7 @@ local function dir(path,opts)
   local visited, depth, entries, cost = {}, integer(opts.depth,1,0,"depth"), 0, 0
   local function walk(current,prefix,level)
     local iter,state = lfs.dir(current)
+    track(state)
     if not iter then return end
     for name in iter,state do
       if name ~= "." and name ~= ".." and valid_utf8(name) then
@@ -525,10 +560,11 @@ local function rg_args(path,opts,files)
 end
 local function open_rg(args, request_path)
   local errors = request_path .. ".stderr"
-  local pipe = checked(io.popen(command(args) .. " 2>" .. quote(errors),"r"))
+  temporary[#temporary + 1] = errors
+  local pipe = checked(open_pipe(command(args) .. " 2>" .. quote(errors)))
   return pipe,function(allow_matchless)
     local ok,_,code = pipe:close()
-    local file = io.open(errors,"rb")
+    local file = open_file(errors,"rb")
     local msg = file and file:read(8192) or ""
     if file then file:close() end
     os.remove(errors)
@@ -650,13 +686,10 @@ local function grep(path,pattern,opts,request_path)
   return {count=count}
 end
 
-local function main(request_path)
-  local request = checked(io.open(request_path,"rb"))
-  local encoded = request:read(MAX_BYTES * 2 + 1)
-  request:close()
-  if not encoded or #encoded > MAX_BYTES * 2 then error("request exceeds the 128 MiB limit",0) end
-  local req = json_decode(encoded)
-  if type(req) ~= "table" then error("request must be an object",0) end
+local function dispatch(req, request_path)
+  if type(req) ~= "table" or req == NULL or getmetatable(req) == ARRAY then
+    error("request must be an object",0)
+  end
   local opts,op = req.opts or {},req.op
   if op == "context" then return {cwd=checked(lfs.currentdir()),home=os.getenv("HOME") or NULL} end
   if op == "abspath" then return abspath(req.path) end
@@ -674,6 +707,106 @@ local function main(request_path)
   error("unknown filesystem operation: " .. tostring(op),0)
 end
 
-local ok,result = pcall(main,arg[1])
-if ok then emit({ok=true,value=result}) else emit({ok=false,error=tostring(result)}) end
+local function respond(req, request_path)
+  send_failed = false
+  local ok, result = pcall(dispatch, req, request_path)
+  cleanup()
+  if send_failed then return nil, tostring(result) end
+  local sent, err = pcall(emit, ok and {ok=true,value=result} or {ok=false,error=tostring(result)})
+  if not sent then return nil, tostring(err) end
+  return true
+end
+
+local function receive_request(client, limit, deadline, clock)
+  local function receive(count)
+    if deadline then
+      local remaining = deadline - clock()
+      if remaining <= 0 then return nil, "authentication timed out" end
+      client:settimeout(remaining)
+    end
+    return client:receive(count)
+  end
+  local header, err = receive(9)
+  if not header then return nil, err end
+  if not header:match("^%x%x%x%x%x%x%x%x\n$") then return nil, "invalid request length header" end
+  local count = tonumber(header:sub(1,8),16)
+  if count == 0 or count > limit then return nil, "request exceeds the allowed size" end
+  local encoded
+  encoded, err = receive(count)
+  if not encoded then return nil, err end
+  local ok, req = pcall(json_decode, encoded)
+  if not ok then return nil, tostring(req) end
+  if type(req) ~= "table" or req == NULL or getmetatable(req) == ARRAY then
+    return nil, "request must be an object"
+  end
+  return req
+end
+
+local function authentic(token, supplied)
+  if type(supplied) ~= "string" then return false end
+  local different = #token ~ #supplied
+  for i = 1, #token do different = different | (token:byte(i) ~ (supplied:byte(i) or 0)) end
+  return different == 0
+end
+
+local function serve(port, token_path)
+  local socket = require("socket")
+  port = tonumber(port)
+  if not port or port % 1 ~= 0 or port < 1 or port > 65535 then error("invalid worker port",0) end
+  local file = checked(io.open(path_string(token_path), "rb"))
+  local token = file:read(256)
+  file:close()
+  token = (token or ""):gsub("\n$", "")
+  if #token ~= 44 or #base64_decode(token) ~= 32 then error("invalid worker authentication token",0) end
+  local listener = checked(socket.bind("0.0.0.0",port,1))
+  listener:settimeout(nil)
+  io.stdout:write(json_encode({ready=true,protocol=PROTOCOL}), "\n")
+  io.stdout:flush()
+
+  while true do
+    local client = checked(listener:accept())
+    client:setoption("tcp-nodelay",true)
+    local auth = receive_request(client,8192,socket.gettime() + 5,socket.gettime)
+    if auth and auth.id == 0 and auth.protocol == PROTOCOL and authentic(token,auth.token) then
+      listener:close()
+      client:settimeout(nil)
+      connection, response_id = client, 0
+      local ok, err = pcall(function()
+        emit({ok=true,protocol=PROTOCOL,context={cwd=checked(lfs.currentdir()),home=os.getenv("HOME") or NULL}})
+        local last_id = 0
+        while true do
+          local req, read_err = receive_request(client,MAX_BYTES * 2)
+          if not req then return read_err end
+          if type(req.id) ~= "number" or req.id % 1 ~= 0 or req.id <= last_id or req.id > 9007199254740991 then
+            return "invalid filesystem request id"
+          end
+          response_id, last_id = req.id, req.id
+          local replied, reply_err = respond(req, token_path .. ".request-" .. tostring(req.id))
+          if not replied then return reply_err end
+        end
+      end)
+      cleanup()
+      client:close()
+      connection, response_id = nil, nil
+      if not ok then io.stderr:write("filesystem worker: ",tostring(err),"\n") end
+      return
+    end
+    client:close()
+  end
+end
+
+if arg[1] == "--serve" then
+  serve(arg[2],arg[3])
+else
+  -- One-shot mode is retained for protocol regression tests and diagnostics.
+  local ok, req = pcall(function()
+    local request = checked(open_file(arg[1],"rb"))
+    local encoded = request:read(MAX_BYTES * 2 + 1)
+    request:close()
+    if not encoded or #encoded > MAX_BYTES * 2 then error("request exceeds the 128 MiB limit",0) end
+    return json_decode(encoded)
+  end)
+  if ok then respond(req,arg[1])
+  else cleanup(); emit({ok=false,error=tostring(req)}) end
+end
 ]====]

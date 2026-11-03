@@ -7,6 +7,7 @@ local SPEC = "io.maki.podman-bash.spec"
 local KEEPALIVE = [[trap 'exit 0' TERM INT
 while :; do sleep 3600 & wait "$!"; done]]
 local SHUTDOWN_RESERVE_MS = 100
+local WORKER_PORT = 39173
 
 local M = {}
 
@@ -47,6 +48,12 @@ function M.new(options)
   local sequence = 0
   local instance = tostring(os.time()) .. "-" .. tostring(math.random(1, 2147483646))
   local manager = {}
+
+  local function invalidate(state, reason)
+    local worker = state.worker
+    state.worker = nil
+    if worker then worker.close(reason or "container changed") end
+  end
 
   local function warn(message)
     maki.log.warn("maki-podman: " .. tostring(message))
@@ -171,8 +178,18 @@ function M.new(options)
   end
 
   local function specification(cwd, resources)
-    return maki.json.encode({ version = 1, cwd = cwd, image = opts.image, shell = opts.shell,
+    return maki.json.encode({ version = 2, cwd = cwd, image = opts.image, shell = opts.shell,
       volume_options = opts.volume_options, mounts = resources and resources.mounts })
+  end
+
+  local function worker_port(info)
+    local ports = info.NetworkSettings and info.NetworkSettings.Ports or {}
+    local bindings = ports[tostring(WORKER_PORT) .. "/tcp"]
+    if type(bindings) ~= "table" or #bindings ~= 1 then return nil end
+    local binding = bindings[1]
+    local port = tonumber(binding.HostPort)
+    if binding.HostIp ~= "127.0.0.1" or not port or port < 1 or port > 65535 or port % 1 ~= 0 then return nil end
+    return port
   end
 
   local function matches(info, cwd, spec, resources)
@@ -199,6 +216,11 @@ function M.new(options)
     local resources = options.resources and options.resources(sid, cwd) or nil
     state.resources = resources
     local spec = specification(cwd, resources)
+    -- A live worker is the readiness proof; this path performs no Podman calls.
+    if state.id and state.cwd == cwd and state.spec == spec and state.worker and state.worker.alive() then
+      return state.id
+    end
+    invalidate(state, "container readiness changed")
     local info, err = find(state)
     if info == nil then
       return nil, err
@@ -227,6 +249,7 @@ function M.new(options)
         "--label", OWNER .. "=1", "--label", SESSION .. "=" .. sid,
         "--label", SPEC .. "=" .. spec,
         "--volume", volume, "--workdir", cwd, "--entrypoint", "/bin/sh",
+        "--publish", "127.0.0.1::" .. WORKER_PORT .. "/tcp",
       }
       for _, mount in ipairs(resources and resources.mounts or {}) do
         local flags = (mount.readonly and "ro" or "rw") .. (opts.volume_options ~= "" and "," .. opts.volume_options or "")
@@ -262,6 +285,8 @@ function M.new(options)
         return nil, start_err
       end
       state.ready_id = nil
+      info, err = inspect(state.id)
+      if not info then return nil, err end
     end
     if ending or state.closed then
       checked({ "stop", "--ignore", "--time", "0", state.id })
@@ -274,6 +299,11 @@ function M.new(options)
       end
       state.ready_id = state.id
     end
+    state.port = worker_port(info)
+    if not state.port then
+      return nil, "container has no private worker port; the plugin requires a local Podman instance with port publishing"
+    end
+    state.cwd, state.spec = cwd, spec
     return state.id
   end
 
@@ -316,6 +346,7 @@ function M.new(options)
 
   local function close(state)
     state.closed = true
+    invalidate(state, "chat is closing")
     if state.preparation then
       state.preparation:cancel()
       state.preparation = nil
@@ -385,7 +416,7 @@ function M.new(options)
     })
   end
 
-  local function spawn(state, cwd, id, command, job_options, ctx, shell)
+  local function spawn(state, cwd, id, command, job_options, ctx, shell, persistent)
     if ctx:cancelled() or state.closed or ending then
       return nil, "the command was cancelled before it started"
     end
@@ -433,7 +464,7 @@ function M.new(options)
         warn("could not start command cancellation: " .. tostring(cleanup_err))
       end
     end
-    maki.async.on_cancel(function() cancel(false) end)
+    if not persistent then maki.async.on_cancel(function() cancel(false) end) end
     return job, nil, function() cancel(true) end
   end
 
@@ -447,7 +478,7 @@ function M.new(options)
       if not cwd then return nil, cwd_err end
       local id, ensure_err = ensure(state, sid, cwd)
       if not id then return nil, ensure_err end
-      return { id = id, cwd = cwd, sid = sid, resources = state.resources, _state = state }
+      return { id = id, cwd = cwd, sid = sid, port = state.port, resources = state.resources, _state = state }
     end)
   end
 
@@ -461,6 +492,38 @@ function M.new(options)
     end
     return spawn(target._state, target.cwd, target.id, table.concat(parts, " "), job_options or {}, ctx, "/bin/sh")
   end
+
+  function manager.worker(target, create)
+    local state = target._state
+    return with_lock(state, function()
+      if ending or state.closed or state.id ~= target.id or state.cwd ~= target.cwd or state.port ~= target.port then
+        return nil, "the chat container changed; start a new file tool call"
+      end
+      if state.worker and state.worker.alive() then return state.worker end
+      invalidate(state, "file worker is unavailable")
+      local worker, err = create()
+      if not worker then return nil, err end
+      if ending or state.closed or state.id ~= target.id then
+        worker.close("chat closed during worker startup")
+        return nil, "the chat closed while its file worker was starting"
+      end
+      state.worker = worker
+      return worker
+    end)
+  end
+
+  function manager.start_worker(target, command, job_options, ctx)
+    local parts = {}
+    for _, arg in ipairs(command) do
+      if type(arg) ~= "string" or arg:find("\0", 1, true) then return nil, "invalid worker argument" end
+      parts[#parts + 1] = "'" .. arg:gsub("'", "'\"'\"'") .. "'"
+    end
+    job_options = copy(job_options or {})
+    job_options.scope = "plugin"
+    return spawn(target._state, target.cwd, target.id, table.concat(parts, " "), job_options, ctx, "/bin/sh", true)
+  end
+
+  function manager.worker_port() return WORKER_PORT end
 
   function manager.copy_in(target, source, destination)
     if ending or target._state.closed then return nil, "the chat is closing" end

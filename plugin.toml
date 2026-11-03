@@ -5,3 +5,5 @@ fs_read = true
 fs_write = true
 run = true
 agent = true
+net = true
+net_hosts = ["127.0.0.1"]
