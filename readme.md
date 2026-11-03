@@ -36,10 +36,15 @@ Requires **Linux**, **Maki 0.7.0+**, **Podman**, **Git**, and **GNU coreutils** 
       plugins[name] = { enabled = false }
     end
 
-    maki.setup({ plugins = plugins })
+    maki.setup({
+      plugins = plugins,
+      net = { allowed_private_hosts = { "127.0.0.1" } },
+    })
     ```
     - Start Maki and approve the plugin installation and requested permissions.
     - The bundled tools must be disabled because `maki-podman` replaces them.
+    - The loopback allowlist lets the plugin connect to its local file worker. Merge it into your existing `maki.setup` call, keeping any other allowed hosts.
+
 
 ## Configuration
 
@@ -54,7 +59,7 @@ Set options under `plugins["maki-podman"]` in `init.lua`.
 | `operation_timeout_ms` | `120000` | Podman and file operation timeout in milliseconds |
 | `remove_on_session_end` | `false` | Remove the container instead of stopping it when the session ends |
 
-Custom images must provide Bash (or the configured shell), Lua 5.4, LuaFileSystem, ripgrep, and GNU coreutils. See [`Containerfile`](Containerfile).
+Custom images must provide Bash (or the configured shell), Lua 5.4, LuaFileSystem, LuaSocket, ripgrep, and GNU coreutils. See [`Containerfile`](Containerfile).
 
 ## Features
 
@@ -62,4 +67,5 @@ Custom images must provide Bash (or the configured shell), Lua 5.4, LuaFileSyste
 - **Workspace mounting**: Mount the current working directory at the same absolute path; recreate the container after `/cd`.
 - **Container-based tools**: Run `bash`, `read`, `write`, `edit`, `list`, `glob`, `grep`, `index`, `view_image`, and related tools against the container filesystem.
 - **Original tool behavior**: Preserve tool interfaces, permission checks, editing safeguards, background commands, memory, and skills.
+- **Persistent file worker**: Reuse one authenticated connection per container for frequent reads and writes.
 - **Persistent project files**: Changes to mounted project files remain on the host.
