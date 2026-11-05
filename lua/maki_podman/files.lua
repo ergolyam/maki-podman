@@ -57,9 +57,16 @@ function M.register(manager, options)
     function wrapped:record_read(path)
       local state = checked(fs.state())
       local version = fs.observed(path) or checked(fs.version(path))
+      local absolute = fs.abspath(path)
+      local ok, err = ctx:record_read(path)
+      if not ok then error(tostring(err or "cannot record file read"), 0) end
+      if absolute ~= path then
+        ok, err = ctx:record_read(absolute)
+        if not ok then error(tostring(err or "cannot record file read"), 0) end
+      end
       local h = history(ctx, state)
       h.versions[version.canonical] = version
-      h.aliases[fs.abspath(path)] = version
+      h.aliases[absolute] = version
       return true
     end
     function wrapped:load_instructions(directory)
@@ -150,9 +157,10 @@ function M.register(manager, options)
         return { llm_output = "file target changed; re-read using read before editing", is_error = true }
       end
       local h = history(ctx, state)
-      local old = h.aliases[fs.abspath(path)] or h.versions[now.canonical]
-      if ctx:config("stale_read_check", true) and old and now.exists
-        and (old.canonical ~= now.canonical or old.fingerprint ~= now.fingerprint) then
+      local alias = h.aliases[fs.abspath(path)]
+      local old = h.versions[now.canonical]
+      if ctx:config("stale_read_check", true) and now.exists
+        and ((alias and alias.canonical ~= now.canonical) or (old and old.fingerprint ~= now.fingerprint)) then
         return { llm_output = "file changed since last read: " .. path .. " - re-read using read tool before editing", is_error = true }
       end
       fs.expect(path, now)
